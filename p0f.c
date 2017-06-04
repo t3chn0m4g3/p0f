@@ -23,6 +23,7 @@
 #include <poll.h>
 #include <time.h>
 #include <locale.h>
+#include <jansson.h>
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -64,13 +65,16 @@
 #  define O_LARGEFILE 0
 #endif /* !O_LARGEFILE */
 
+static json_t *json_record = NULL;
+
 static u8 *use_iface,                   /* Interface to listen on             */
           *orig_rule,                   /* Original filter rule               */
           *switch_user,                 /* Target username                    */
           *log_file,                    /* Binary log file name               */
           *api_sock,                    /* API socket file name               */
-          *fp_file,                     /* Location of p0f.fp                 */
-          *read_file;                   /* File to read pcap data from        */
+          *fp_file;                     /* Location of p0f.fp                 */
+
+u8* read_file;                          /* File to read pcap data from        */
 
 static u32
   api_max_conn    = API_MAX_CONN;       /* Maximum number of API connections  */
@@ -91,9 +95,11 @@ static FILE* lf;                        /* Log file stream                    */
 static u8 stop_soon;                    /* Ctrl-C or so pressed?              */
 
 u8 daemon_mode;                         /* Running in daemon mode?            */
+u8 json_mode;                           /* Log in JSON?                       */
+u8 line_buffered_mode;                  /* Line Buffered Mode?                */
 
 static u8 set_promisc;                  /* Use promiscuous mode?              */
-         
+
 static pcap_t *pt;                      /* PCAP capture thingy                */
 
 s32 link_type;                          /* PCAP link type                     */
@@ -130,6 +136,8 @@ static void usage(void) {
 "\n"
 "  -f file   - read fingerprint database from 'file' (%s)\n"
 "  -o file   - write information to the specified log file\n"
+"  -j        - Log in JSON format.\n"
+"  -l        - Line buffered mode for logging to output file.\n"
 #ifndef __CYGWIN__
 "  -s name   - answer to API queries at a named unix socket\n"
 #endif /* !__CYGWIN__ */
@@ -334,16 +342,25 @@ void start_observation(char* keyword, u8 field_cnt, u8 to_srv,
 
     strftime((char*)tmp, 64, "%Y/%m/%d %H:%M:%S", lt);
 
-    LOGF("[%s] mod=%s|cli=%s/%u|",tmp, keyword, addr_to_str(f->client->addr,
+    if (json_mode) {
+        json_record = json_object();
+        json_object_set_new(json_record, "timestamp", json_string((char *)tmp));
+        json_object_set_new(json_record, "mod", json_string((char *)keyword));
+        json_object_set_new(json_record, "client_ip", json_string((char *)addr_to_str(f->client->addr, f->client->ip_ver)));
+        json_object_set_new(json_record, "server_ip", json_string((char *)addr_to_str(f->server->addr, f->server->ip_ver)));
+        json_object_set_new(json_record, "client_port", json_integer(f->cli_port));
+        json_object_set_new(json_record, "server_port", json_integer(f->srv_port));
+        json_object_set_new(json_record, "subject", json_string((char *)(to_srv ? "cli" : "srv")));
+    } else {
+      LOGF("[%s] mod=%s|cli=%s/%u|",tmp, keyword, addr_to_str(f->client->addr,
          f->client->ip_ver), f->cli_port);
 
-    LOGF("srv=%s/%u|subj=%s", addr_to_str(f->server->addr, f->server->ip_ver),
+      LOGF("srv=%s/%u|subj=%s", addr_to_str(f->server->addr, f->server->ip_ver),
          f->srv_port, to_srv ? "cli" : "srv");
-
+    }
   }
 
   obs_fields = field_cnt;
-
 }
 
 
@@ -356,7 +373,13 @@ void add_observation_field(char* key, u8* value) {
   if (!daemon_mode)
     SAYF("| %-8s = %s\n", key, value ? value : (u8*)"???");
 
-  if (log_file) LOGF("|%s=%s", key, value ? value : (u8*)"???");
+  if (log_file) {
+    if (json_mode) {
+      json_object_set_new(json_record, key, json_string( (char *)(value ? value : (u8*)"???") ));
+    } else {
+      LOGF("|%s=%s", key, value ? value : (u8*)"???");
+    }
+  }
 
   obs_fields--;
 
@@ -364,7 +387,18 @@ void add_observation_field(char* key, u8* value) {
 
     if (!daemon_mode) SAYF("|\n`----\n\n");
 
-    if (log_file) LOGF("\n");
+    if (log_file){
+
+      if (json_mode) {
+        json_dumpf(json_record, lf, 0);
+        json_decref(json_record);
+      }
+
+      LOGF("\n");
+      if (line_buffered_mode) {
+        fflush(lf);
+      }
+    }
 
   }
 
@@ -510,10 +544,10 @@ static void prepare_pcap(void) {
 
 #else 
 
-    /* PCAP timeouts tend to be broken, so we'll use a minimum value
+    /* PCAP timeouts tend to be broken, so we'll use a very small value
        and rely on select() instead. */
 
-    pt = pcap_open_live((char*)use_iface, SNAPLEN, set_promisc, 1, pcap_err);
+    pt = pcap_open_live((char*)use_iface, SNAPLEN, set_promisc, 5, pcap_err);
 
 #endif /* ^__CYGWIN__ */
 
@@ -805,12 +839,15 @@ static void live_event_loop(void) {
     s32 pret, i;
     u32 cur;
 
-    /* We use a 250 ms timeout to keep Ctrl-C responsive without resortng to
-       silly sigaction hackery or unsafe signal handler code. */
+    /* We had a 250 ms timeout to keep Ctrl-C responsive without resortng
+       to silly sigaction hackery or unsafe signal handler code. Unfortunately,
+       if poll() timeout is much longer than pcap timeout, we end up with
+       dropped packets on VMs. Seems like a kernel bug, but for now, this
+       loop is a bit busier than it needs to be... */
 
 poll_again:
 
-    pret = poll(pfds, pfd_count, 250);
+    pret = poll(pfds, pfd_count, 10);
 
     if (pret < 0) {
       if (errno == EINTR) break;
@@ -1023,7 +1060,7 @@ int main(int argc, char** argv) {
   if (getuid() != geteuid())
     FATAL("Please don't make me setuid. See README for more.\n");
 
-  while ((r = getopt(argc, argv, "+LS:df:i:m:o:pr:s:t:u:")) != -1) switch (r) {
+  while ((r = getopt(argc, argv, "+LS:djlf:i:m:o:pr:s:t:u:")) != -1) switch (r) {
 
     case 'L':
 
@@ -1074,6 +1111,22 @@ int main(int argc, char** argv) {
 
       use_iface = (u8*)optarg;
 
+      break;
+
+    case 'j':
+
+      if (json_mode)
+        FATAL("Double werewolf mode not supported yet.");
+
+      json_mode = 1;
+      break;
+
+    case 'l':
+
+      if (line_buffered_mode)
+        FATAL("Double werewolf mode not supported yet.");
+
+      line_buffered_mode = 1;
       break;
 
     case 'm':
